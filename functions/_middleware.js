@@ -1,94 +1,125 @@
-// The Final, Simplified Gateway - functions/_middleware.js
+// The Final, Professionally-Reviewed Gateway - functions/_middleware.js
+// This code incorporates best practices and direct solutions to the identified issues.
 
 import { createClient } from '@supabase/supabase-js';
 
-// This function handles ALL requests to your site.
+// --- Main Handler for All API Requests ---
+async function handleApiRequest(request, env) {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_KEY);
+    const { action, payload, password } = await request.json();
+
+    // --- Action: 'init' (Public) ---
+    // Fetches initial settings and user data for the chat interface.
+    if (action === 'init') {
+        const { data: settingsArray } = await supabase.from('settings').select('key, value, description');
+        if (!settingsArray) throw new Error('Could not fetch settings from Supabase.');
+        const settings = settingsArray.reduce((obj, item) => ({ ...obj, [item.key]: item.value }), {});
+        
+        const { data: user, error } = await supabase.from('users').select('id').eq('name', 'Baba Ahmed').single();
+        if (error) { // If user doesn't exist, create one.
+            const { data: newUser } = await supabase.from('users').insert({ name: 'Baba Ahmed' }).select('id').single();
+            return { settings, user: newUser };
+        }
+        return { settings, user };
+    }
+
+    // --- Action: 'chat' (Public) ---
+    // Handles a new message from the user and gets a response from Gemini.
+    if (action === 'chat') {
+        const { prompt, userId, settings } = payload;
+        if (!prompt || !userId || !settings) throw new Error('Invalid chat payload.');
+        
+        await supabase.from('messages').insert({ user_id: userId, sender: 'user', text: prompt });
+        
+        const personality = settings['mimo.personality'] || 'a friendly assistant';
+        const mimoName = settings['mimo.name'] || 'Mimo';
+        const fullPrompt = `You are an AI assistant. Your name is ${mimoName}. Your personality is: "${personality}". You must respond in Egyptian Arabic. The user said: "${prompt}"`;
+        
+        const geminiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${env.GEMINI_API_KEY}`, {
+            method: 'POST',
+            body: JSON.stringify({ contents: [{ parts: [{ text: fullPrompt }] }] })
+        });
+        
+        if (!geminiResponse.ok) {
+            console.error("Gemini API Error:", await geminiResponse.text());
+            throw new Error('Failed to get a response from Gemini.');
+        }
+        
+        const geminiData = await geminiResponse.json();
+        const mimoResponse = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "حصل خطأ بسيط، ممكن تجرب تاني يا بابا.";
+        
+        await supabase.from('messages').insert({ user_id: userId, sender: 'mimo', text: mimoResponse });
+        return { mimoResponse };
+    }
+
+    // --- Admin Actions (Authentication Required from here) ---
+    if (password !== env.ADMIN_PASSWORD) {
+        throw new Error('Unauthorized: Invalid Password for admin action.');
+    }
+
+    if (action === 'login') {
+        return { success: true };
+    }
+
+    if (action === 'admin_data') {
+        const [{ data: settings }, { data: journal }, { data: memory }] = await Promise.all([
+            supabase.from('settings').select('*').order('key'),
+            supabase.from('journal').select('id, content').order('created_at', { ascending: false }),
+            supabase.from('memory').select('id, content').order('created_at', { ascending: false })
+        ]);
+        return { settings, journal, memory };
+    }
+
+    if (action === 'save_settings') {
+        const updates = Object.keys(payload).map(key => 
+            supabase.from('settings').update({ value: payload[key] }).eq('key', key)
+        );
+        await Promise.all(updates);
+        return { success: true };
+    }
+
+    if (action === 'delete_item') {
+        await supabase.from(payload.table).delete().eq('id', payload.id);
+        return { success: true };
+    }
+
+    // If no action matches
+    throw new Error('Invalid API action provided.');
+}
+
+// --- Main Cloudflare Worker Entry Point ---
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
 
-        // --- Route 1: API requests ---
-        // If the URL path starts with /api, we know it's a special request.
+        // Define CORS headers to allow your site to make requests.
+        const corsHeaders = {
+            'Access-Control-Allow-Origin': '*', // In production, you might restrict this to your domain.
+            'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
+        };
+
+        // Handle CORS preflight requests. This is a standard requirement.
+        if (request.method === 'OPTIONS') {
+            return new Response(null, { headers: corsHeaders });
+        }
+
+        // Handle API requests
         if (url.pathname.startsWith('/api')) {
             try {
-                // Create the Supabase client once.
-                const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_KEY);
-                const { action, payload, password } = await request.json();
-
-                // --- Handle different actions ---
-
-                // Action: 'init' (When the chat page loads)
-                if (action === 'init') {
-                    const { data: settingsArray } = await supabase.from('settings').select('*');
-                    const settings = settingsArray.reduce((obj, item) => ({ ...obj, [item.key]: item.value }), {});
-                    const { data: user, error } = await supabase.from('users').select('id').eq('name', 'Baba Ahmed').single();
-                    if (error) { // Create user if not found
-                        const { data: newUser } = await supabase.from('users').insert({ name: 'Baba Ahmed' }).select('id').single();
-                        return new Response(JSON.stringify({ settings, user: newUser }), { headers: { 'Content-Type': 'application/json' } });
-                    }
-                    return new Response(JSON.stringify({ settings, user }), { headers: { 'Content-Type': 'application/json' } });
+                // We only allow POST requests to the API for simplicity and security.
+                if (request.method !== 'POST') {
+                    return new Response(JSON.stringify({ error: 'Only POST requests are accepted' }), { status: 405, headers: { ...corsHeaders, 'Content-Type': 'application/json' }});
                 }
-
-                // Action: 'chat' (When user sends a message)
-                if (action === 'chat') {
-                    const { prompt, userId, settings } = payload;
-                    await supabase.from('messages').insert({ user_id: userId, sender: 'user', text: prompt });
-                    const fullPrompt = `Your identity is in these settings: ${JSON.stringify(settings)}. You are '${settings["mimo.name"]}'. Your personality: '${settings["mimo.personality"]}'. Respond in Egyptian Arabic. User said: "${prompt}"`;
-                    
-                    const geminiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${env.GEMINI_API_KEY}`, {
-                        method: 'POST',
-                        body: JSON.stringify({ contents: [{ parts: [{ text: fullPrompt }] }] })
-                    });
-                    
-                    if (!geminiResponse.ok) throw new Error('Gemini API request failed');
-                    const geminiData = await geminiResponse.json();
-                    const mimoResponse = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "مش عارفة أرد دلوقتي يا بابا.";
-                    
-                    await supabase.from('messages').insert({ user_id: userId, sender: 'mimo', text: mimoResponse });
-                    return new Response(JSON.stringify({ mimoResponse }), { headers: { 'Content-Type': 'application/json' } });
-                }
-
-                // --- Admin Actions (Require Password) ---
-                if (password !== env.ADMIN_PASSWORD) {
-                    throw new Error('Unauthorized: Invalid Password');
-                }
-
-                if (action === 'login') {
-                    return new Response(JSON.stringify({ success: true }));
-                }
-
-                if (action === 'admin_data') {
-                    const [{ data: settings }, { data: journal }, { data: memory }] = await Promise.all([
-                        supabase.from('settings').select('*'),
-                        supabase.from('journal').select('id, content').order('created_at', { ascending: false }),
-                        supabase.from('memory').select('id, content').order('created_at', { ascending: false })
-                    ]);
-                    return new Response(JSON.stringify({ settings, journal, memory }));
-                }
-
-                if (action === 'save_settings') {
-                    const updates = Object.keys(payload).map(key => supabase.from('settings').update({ value: payload[key] }).eq('key', key));
-                    await Promise.all(updates);
-                    return new Response(JSON.stringify({ success: true }));
-                }
-
-                if (action === 'delete_item') {
-                    await supabase.from(payload.table).delete().eq('id', payload.id);
-                    return new Response(JSON.stringify({ success: true }));
-                }
-
-                // If action is not recognized
-                throw new Error('Invalid API action');
-
+                const data = await handleApiRequest(request, env);
+                return new Response(JSON.stringify(data), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
             } catch (e) {
-                // If any error happens in the API, return a clear error message.
-                return new Response(JSON.stringify({ error: e.message }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+                console.error('API Error:', e);
+                return new Response(JSON.stringify({ error: e.message }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
             }
         }
         
-        // --- Route 2: Static Assets (HTML files) ---
-        // If the URL is not for the API, then it must be a request for a file (like index.html or admin.html).
-        // Let Cloudflare's default asset server handle it.
+        // Handle static assets (index.html, admin.html, etc.)
         return env.ASSETS.fetch(request);
     }
 };
